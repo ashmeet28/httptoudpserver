@@ -6,39 +6,98 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 func main() {
 	httpToUdpCh := make(chan string)
 
-	http.HandleFunc("GET /sendpacket", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Add("Access-Control-Allow-Origin", "*")
-		w.Header().Add("Access-Control-Allow-Headers", "*")
-		w.Header().Add("Access-Control-Allow-Methods", "*")
-		w.Header().Add("Access-Control-Expose-Headers", "*")
+	var wsUpgrader = websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin: func(r *http.Request) bool {
+			return true
+		},
+	}
 
-		if r.Method == http.MethodGet && r.URL.Path == "/sendpacket" {
-			p := r.Header.Get("httptoudpserver-content")
+	var reqBalancer []int
+	var reqBalancerMu sync.Mutex
 
-			if p != "" {
-				httpToUdpCh <- p
+	http.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/" {
+			c, err := wsUpgrader.Upgrade(w, r, nil)
+			if err != nil {
+				log.Println(err)
+				return
 			}
 
-			w.WriteHeader(http.StatusOK)
-		} else {
-			w.WriteHeader(http.StatusNotFound)
-		}
-	})
+			reqBalancerMu.Lock()
 
-	http.HandleFunc("OPTIONS /sendpacket", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Add("Access-Control-Allow-Origin", "*")
-		w.Header().Add("Access-Control-Allow-Headers", "*")
-		w.Header().Add("Access-Control-Allow-Methods", "*")
-		w.Header().Add("Access-Control-Expose-Headers", "*")
+			connIndex := len(reqBalancer)
+			reqBalancer = append(reqBalancer, 0)
 
-		if r.URL.Path == "/sendpacket" {
-			w.WriteHeader(http.StatusOK)
+			reqBalancerMu.Unlock()
+
+			for {
+				messageType, p, err := c.ReadMessage()
+				if err != nil {
+					reqBalancerMu.Lock()
+					reqBalancer[connIndex] = 2
+					reqBalancerMu.Unlock()
+
+					log.Println(err)
+					return
+				}
+
+				for {
+					canSend := false
+
+					reqBalancerMu.Lock()
+
+					isPending := false
+
+					for _, s := range reqBalancer {
+						if s == 0 {
+							isPending = true
+							break
+						}
+					}
+
+					if !isPending {
+						for i, s := range reqBalancer {
+							if s == 1 {
+								reqBalancer[i] = 0
+							}
+						}
+					}
+
+					if reqBalancer[connIndex] == 0 {
+						canSend = true
+					}
+
+					reqBalancerMu.Unlock()
+
+					if canSend {
+						if err := c.WriteMessage(messageType, p); err != nil {
+							reqBalancerMu.Lock()
+							reqBalancer[connIndex] = 2
+							reqBalancerMu.Unlock()
+
+							log.Println(err)
+							return
+						} else {
+							reqBalancerMu.Lock()
+							reqBalancer[connIndex] = 1
+							reqBalancerMu.Unlock()
+							break
+						}
+					}
+
+				}
+			}
 		} else {
 			w.WriteHeader(http.StatusNotFound)
 		}
